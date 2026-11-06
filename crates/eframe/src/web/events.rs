@@ -94,7 +94,7 @@ pub(crate) fn install_event_handlers(runner_ref: &WebRunner) -> Result<(), JsVal
     install_pointerdown(runner_ref, &canvas)?;
     install_mouseleave(runner_ref, &canvas)?;
 
-    install_touchstart(runner_ref, &canvas)?;
+    install_touchstart(runner_ref, &canvas, true)?;
     // Use `document` here to notice if the user drag outside of the canvas:
     // See https://github.com/emilk/egui/issues/3157
     install_touchmove(runner_ref, &document)?;
@@ -536,6 +536,7 @@ fn install_pointerdown(runner_ref: &WebRunner, target: &EventTarget) -> Result<(
         target,
         "pointerdown",
         |event: web_sys::PointerEvent, runner: &mut AppRunner| {
+            runner.text_agent.set_touch(event.pointer_type() != "mouse");
             let modifiers = modifiers_from_mouse_event(&event);
             runner.input.set_modifiers(modifiers);
             let mut should_stop_propagation = true;
@@ -596,12 +597,18 @@ fn install_pointerup(runner_ref: &WebRunner, target: &EventTarget) -> Result<(),
                     (runner.web_options.should_prevent_default)(&egui_event);
                 runner.input.raw.events.push(egui_event);
 
+                // The touch was on the text agent, lying over the focused `TextEdit`
+                // (see `TextAgent::set_touch`): it is the browser's, to open its text menu.
+                let on_text_agent = runner.text_agent.is_target(event.target().as_ref());
+
                 // Previously on iOS, the canvas would not receive focus on
                 // any touch event, which resulted in the on-screen keyboard
                 // not working when focusing on a text field in an egui app.
                 // This attempts to fix that by forcing the focus on any
                 // click on the canvas.
-                super::focus_without_scroll(runner.canvas()).ok();
+                if !on_text_agent {
+                    super::focus_without_scroll(runner.canvas()).ok();
+                }
 
                 // In Safari we are only allowed to do certain things
                 // (like playing audio, start a download, etc)
@@ -612,7 +619,7 @@ fn install_pointerup(runner_ref: &WebRunner, target: &EventTarget) -> Result<(),
                 // Make sure we paint the output of the above logic call asap:
                 runner.needs_repaint.repaint_asap();
 
-                if should_prevent_default {
+                if should_prevent_default && !on_text_agent {
                     event.prevent_default();
                 }
 
@@ -695,11 +702,17 @@ fn install_mouseleave(runner_ref: &WebRunner, target: &EventTarget) -> Result<()
     )
 }
 
-fn install_touchstart(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), JsValue> {
+/// `prevent_default`: whether the browser's own handling of the touch may be prevented. Not
+/// on the text agent, whose touches open the browser's text menu.
+fn install_touchstart(
+    runner_ref: &WebRunner,
+    target: &EventTarget,
+    prevent_default: bool,
+) -> Result<(), JsValue> {
     runner_ref.add_event_listener(
         target,
         "touchstart",
-        |event: web_sys::TouchEvent, runner| {
+        move |event: web_sys::TouchEvent, runner| {
             let mut should_stop_propagation = true;
             let mut should_prevent_default = true;
             if let Some((pos, _)) = primary_touch_pos(runner, &event) {
@@ -722,7 +735,7 @@ fn install_touchstart(runner_ref: &WebRunner, target: &EventTarget) -> Result<()
                 event.stop_propagation();
             }
 
-            if should_prevent_default {
+            if should_prevent_default && prevent_default {
                 event.prevent_default();
             }
         },
@@ -793,18 +806,34 @@ fn install_touchend(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), 
                 event.stop_propagation();
             }
 
-            if should_prevent_default {
+            // A touch on the text agent is the browser's, to open its text menu, which taking
+            // the agent's focus away and back would close (see `TextAgent::set_touch`).
+            let on_text_agent = runner.text_agent.is_target(event.target().as_ref());
+
+            if should_prevent_default && !on_text_agent {
                 event.prevent_default();
             }
 
             // Fix virtual keyboard IOS
             // Need call focus at the same time of event
-            if runner.text_agent.has_focus() {
+            if runner.text_agent.has_focus() && !on_text_agent {
                 runner.text_agent.set_focus(false);
                 runner.text_agent.set_focus(true);
             }
         }
     })
+}
+
+/// The touches on the text agent, while it lies over the focused `TextEdit` (see
+/// `TextAgent::set_touch`): they go to egui as the canvas's would, but leave the browser
+/// free to open its text menu. Moving and lifting the finger are on the `document` already.
+pub(crate) fn install_text_agent_touches(
+    runner_ref: &WebRunner,
+    input: &EventTarget,
+) -> Result<(), JsValue> {
+    install_pointerdown(runner_ref, input)?;
+    install_touchstart(runner_ref, input, false)?;
+    install_touchcancel(runner_ref, input)
 }
 
 fn install_touchcancel(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), JsValue> {

@@ -44,6 +44,10 @@ impl TextAgent {
         style.set_property("height", "1px")?;
         style.set_property("caret-color", "transparent")?;
         style.set_property("position", "absolute")?;
+        // So that `width` includes the padding that lines the caret up with egui's
+        // (see `InputState::update`).
+        style.set_property("box-sizing", "border-box")?;
+        style.set_property("padding", "0")?;
         style.set_property("top", &format!("{}px", canvas.offset_top()))?;
         style.set_property("left", &format!("{}px", canvas.offset_left()))?;
         // Prevent auto-zoom on mobile browsers (requires at least 16px).
@@ -97,6 +101,11 @@ impl TextAgent {
             }
         })?;
 
+        // While the agent lies over the focused `TextEdit` on a touch screen (see
+        // `InputState::update`), the touches there land on the agent, not the canvas.
+        // egui must still get them, to place the cursor and select:
+        super::events::install_text_agent_touches(runner_ref, &input)?;
+
         runner_ref.add_event_listener(&input, "keydown", {
             let input_state = Rc::clone(&input_state);
             move |event: web_sys::KeyboardEvent, runner: &mut AppRunner| {
@@ -132,6 +141,21 @@ impl TextAgent {
         self.input_state
             .borrow_mut()
             .update(ime, canvas, zoom_factor)
+    }
+
+    /// Whether the last pointer to go down was a finger or a pen, rather than a mouse.
+    ///
+    /// On a touch screen, the agent lies over the text of the focused `TextEdit`, so that
+    /// touching the text touches a real `<input>`: holding it, or tapping its caret, opens the
+    /// browser's own text menu, with Paste. Nothing else pastes on a phone, which has no
+    /// keyboard shortcut for it (<https://github.com/emilk/egui/issues/501>).
+    pub fn set_touch(&self, touch: bool) {
+        self.input_state.borrow_mut().touch = touch;
+    }
+
+    /// Whether `target` (of a DOM event) is the agent.
+    pub fn is_target(&self, target: Option<&web_sys::EventTarget>) -> bool {
+        target.is_some_and(|target| self.input.unchecked_ref::<web_sys::EventTarget>() == target)
     }
 
     pub fn set_focus(&self, on: bool) {
@@ -187,6 +211,12 @@ struct InputState {
     last_text: String,
     ime_output: Option<egui::output::IMEOutput>,
     keydown_special_case: KeydownSpecialCase,
+
+    /// See [`TextAgent::set_touch`].
+    touch: bool,
+
+    /// Whether the agent lies over the focused `TextEdit`, to take its touches.
+    covers_text_edit: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -225,6 +255,8 @@ impl InputState {
             last_text: String::new(),
             ime_output: None,
             keydown_special_case: KeydownSpecialCase::None,
+            touch: false,
+            covers_text_edit: false,
         }
     }
 
@@ -234,11 +266,24 @@ impl InputState {
         canvas: &web_sys::HtmlCanvasElement,
         zoom_factor: f32,
     ) -> Result<(), JsValue> {
+        let covers_text_edit = self.touch && ime.is_some();
+
         // Don't move the text agent unless the position actually changed:
-        if self.ime_output == ime {
+        if self.ime_output == ime && self.covers_text_edit == covers_text_edit {
             return Ok(());
         }
         self.ime_output = ime;
+        let style = self.input.style();
+        if self.covers_text_edit != covers_text_edit {
+            self.covers_text_edit = covers_text_edit;
+            if !covers_text_edit {
+                style.set_property("opacity", "0")?;
+                style.set_property("pointer-events", "none")?;
+                style.set_property("width", "1px")?;
+                style.set_property("height", "1px")?;
+                style.set_property("padding-left", "0")?;
+            }
+        }
 
         let Some(ime) = ime else { return Ok(()) };
 
@@ -247,7 +292,6 @@ impl InputState {
         // For example, Chrome's password manager will always think the last
         // letter typed in the password field is the password.
 
-        let style = self.input.style();
         let native_ppp = super::native_pixels_per_point();
 
         // The input is a sibling of the canvas (see `attach`), so we position
@@ -266,15 +310,42 @@ impl InputState {
         let visible_y = ime.cursor_rect.center().y * zoom_factor;
         let clamped_y = visible_y.clamp(0.0, logical_canvas_height);
 
-        // This is where the IME input will point to:
-        style.set_property(
-            "left",
-            &format!("{}px", canvas.offset_left() as f32 + clamped_x),
-        )?;
-        style.set_property(
-            "top",
-            &format!("{}px", canvas.offset_top() as f32 + clamped_y),
-        )?;
+        if covers_text_edit {
+            // Lie over the text edit's text (within the canvas), with the left padding putting
+            // the input's own caret where egui's is: that is where the IME input points to,
+            // and where the browser's text menu opens.
+            let canvas_rect = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(logical_canvas_width, logical_canvas_height),
+            );
+            let rect = (ime.rect * zoom_factor).intersect(canvas_rect);
+            let padding_left = (clamped_x - rect.left()).clamp(0.0, rect.width());
+            style.set_property(
+                "left",
+                &format!("{}px", canvas.offset_left() as f32 + rect.left()),
+            )?;
+            style.set_property(
+                "top",
+                &format!("{}px", canvas.offset_top() as f32 + rect.top()),
+            )?;
+            style.set_property("width", &format!("{}px", rect.width()))?;
+            style.set_property("height", &format!("{}px", rect.height()))?;
+            style.set_property("padding-left", &format!("{padding_left}px"))?;
+            style.set_property("pointer-events", "auto")?;
+            // Still invisible, its text, caret and background being transparent: iOS Safari
+            // opens no text menu on an editable element it takes for hidden, at opacity 0.
+            style.set_property("opacity", "1")?;
+        } else {
+            // This is where the IME input will point to:
+            style.set_property(
+                "left",
+                &format!("{}px", canvas.offset_left() as f32 + clamped_x),
+            )?;
+            style.set_property(
+                "top",
+                &format!("{}px", canvas.offset_top() as f32 + clamped_y),
+            )?;
+        }
 
         Ok(())
     }
