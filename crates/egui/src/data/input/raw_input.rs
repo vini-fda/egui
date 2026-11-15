@@ -89,6 +89,15 @@ pub struct RawInput {
     ///
     /// `None` means "don't know".
     pub system_theme: Option<Theme>,
+
+    /// The integration mirrors the focused single-line [`crate::TextEdit`] in a native text
+    /// field of its own, which draws the caret, the selection and any IME composition, and
+    /// takes the touches on the text (e.g. `eframe` on a touch screen, for iOS's text menu).
+    ///
+    /// egui then describes the field in [`crate::PlatformOutput::text_edit_mirror`] instead of
+    /// drawing the caret, the selection and the composition itself, and takes the native
+    /// field's edits as [`crate::ImeEvent::ReplaceRange`] and [`crate::ImeEvent::SetSelection`].
+    pub text_edit_mirror: bool,
 }
 
 impl Default for RawInput {
@@ -105,6 +114,7 @@ impl Default for RawInput {
             dropped_files: Default::default(),
             focused: true, // integrations opt into global focus tracking
             system_theme: None,
+            text_edit_mirror: false,
             safe_area_insets: Default::default(),
         }
     }
@@ -139,6 +149,7 @@ impl RawInput {
             dropped_files: core::mem::take(&mut self.dropped_files),
             focused: self.focused,
             system_theme: self.system_theme,
+            text_edit_mirror: self.text_edit_mirror,
         }
     }
 
@@ -156,6 +167,7 @@ impl RawInput {
             mut dropped_files,
             focused,
             system_theme,
+            text_edit_mirror,
             safe_area_insets: safe_area,
         } = newer;
 
@@ -170,6 +182,7 @@ impl RawInput {
         self.dropped_files.append(&mut dropped_files);
         self.focused = focused;
         self.system_theme = system_theme;
+        self.text_edit_mirror = text_edit_mirror;
         self.safe_area_insets = safe_area.or(self.safe_area_insets);
     }
 }
@@ -188,6 +201,7 @@ impl RawInput {
             dropped_files,
             focused,
             system_theme,
+            text_edit_mirror,
             safe_area_insets: safe_area,
         } = self;
 
@@ -217,6 +231,7 @@ impl RawInput {
         ui.label(format!("dropped_files: {}", dropped_files.len()));
         ui.label(format!("focused: {focused}"));
         ui.label(format!("system_theme: {system_theme:?}"));
+        ui.label(format!("text_edit_mirror: {text_edit_mirror}"));
         ui.label(format!("safe_area: {safe_area:?}"));
         ui.scope(|ui| {
             ui.set_min_height(150.0);

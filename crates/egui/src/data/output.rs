@@ -113,6 +113,49 @@ pub struct IMEOutput {
     pub should_interrupt_composition: bool,
 }
 
+/// The focused single-line [`crate::TextEdit`], for an integration that mirrors it in a native
+/// text field of its own (see [`crate::RawInput::text_edit_mirror`]).
+///
+/// The native field should hold the same text, select the same characters, and lay them out
+/// in the same place, in the same font: then the platform's own text interaction (selection
+/// handles, magnifier, edit menu) lands on what egui draws.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct TextEditMirror {
+    /// The whole text, unmasked even for a password (see [`IMEOutput::purpose`]).
+    pub text: String,
+
+    /// Where the selection starts, in characters (not bytes).
+    pub anchor_chars: usize,
+
+    /// Where the selection ends, and the cursor is, in characters (not bytes).
+    ///
+    /// May come before [`Self::anchor_chars`].
+    pub focus_chars: usize,
+
+    /// The whole field, frame included, in screen coordinates (points): touching anywhere in
+    /// it touches the field. Its text is clipped to [`IMEOutput::rect`], within it.
+    pub field_rect: crate::Rect,
+
+    /// Where egui draws the start of the text's first row, in screen coordinates (points).
+    ///
+    /// When the text is scrolled to the left, this is to the left of [`IMEOutput::rect`].
+    pub text_origin: crate::Pos2,
+
+    /// The font of the text, at its size before [`Self::scale`].
+    pub font_id: crate::FontId,
+
+    /// The height of a row of text, in points, before [`Self::scale`].
+    pub row_height: f32,
+
+    /// The color of the text cursor.
+    pub cursor_color: crate::Color32,
+
+    /// How much the field's layer is scaled on screen (1 unless it's in a scaled layer):
+    /// the text's size on screen is `font_id.size * scale` points.
+    pub scale: f32,
+}
+
 /// Commands that the egui integration should execute at the end of a frame.
 ///
 /// Commands that are specific to a viewport should be put in [`crate::ViewportCommand`] instead.
@@ -179,6 +222,12 @@ pub struct PlatformOutput {
     /// events (see [`crate::Memory::owns_ime_events`]).
     pub ime: Option<IMEOutput>,
 
+    /// The focused single-line [`crate::TextEdit`], for an integration that mirrors it in a
+    /// native text field (see [`crate::RawInput::text_edit_mirror`]).
+    ///
+    /// Set together with [`Self::ime`], and only when the integration asked for it.
+    pub text_edit_mirror: Option<TextEditMirror>,
+
     /// The difference in the widget tree since last frame.
     ///
     /// NOTE: this needs to be per-viewport.
@@ -229,6 +278,7 @@ impl PlatformOutput {
             mut events,
             mutable_text_under_cursor,
             ime,
+            text_edit_mirror,
             accesskit_update,
             num_completed_passes,
             mut request_discard_reasons,
@@ -240,6 +290,7 @@ impl PlatformOutput {
         self.events.append(&mut events);
         self.mutable_text_under_cursor = mutable_text_under_cursor;
         self.ime = ime.or(self.ime);
+        self.text_edit_mirror = text_edit_mirror.or_else(|| self.text_edit_mirror.take());
         self.num_completed_passes += num_completed_passes;
         self.request_discard_reasons
             .append(&mut request_discard_reasons);

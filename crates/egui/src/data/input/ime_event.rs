@@ -31,6 +31,27 @@ pub enum ImeEvent {
         after_chars: usize,
     },
 
+    /// The integration's native text field replaced the characters in `range_chars` with
+    /// `text`, and the cursor is now after `text`.
+    ///
+    /// Only sent while the integration mirrors the field (see
+    /// [`crate::RawInput::text_edit_mirror`]). `range_chars` counts characters (not bytes) of
+    /// the whole text, as in [`crate::output::TextEditMirror::text`].
+    ReplaceRange {
+        range_chars: core::ops::Range<usize>,
+        text: String,
+    },
+
+    /// The integration's native text field selected from `anchor_chars` to `focus_chars`.
+    ///
+    /// Only sent while the integration mirrors the field (see
+    /// [`crate::RawInput::text_edit_mirror`]). The indices count characters (not bytes), and
+    /// `focus_chars` is where the cursor is, which may come before `anchor_chars`.
+    SetSelection {
+        anchor_chars: usize,
+        focus_chars: usize,
+    },
+
     /// Notifies when the IME was disabled.
     #[deprecated = "No longer used by egui"]
     Disabled,

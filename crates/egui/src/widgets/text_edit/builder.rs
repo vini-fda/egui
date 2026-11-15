@@ -571,6 +571,15 @@ impl<'t> TextEdit<'t> {
         // `min_size` overrides available width
         let allocate_width = desired_width.at_most(available_width).at_least(min_size.x);
 
+        // An integration that mirrors the field in a native text field (see
+        // `RawInput::text_edit_mirror`) can only copy plain text, laid out in one row:
+        let mirrored = interactive
+            && !multiline
+            && layouter.is_none()
+            && text.is_mutable()
+            && ui.input(|i| i.raw.text_edit_mirror);
+        let mirror_font_id = font_id.clone();
+
         let mut default_layouter = move |ui: &Ui, text: &dyn TextBuffer, wrap_width: f32| {
             let text = mask_if_password(password, text.as_str());
             let mut layout_job = if multiline {
@@ -877,6 +886,15 @@ impl<'t> TextEdit<'t> {
                 is_being_dragged,
             );
 
+            if response.clicked() && !response.sense.senses_drag() {
+                // An unfocused field on a touch screen senses only clicks (see
+                // `allow_drag_to_select`), so nothing put the cursor on the press. A tap puts it
+                // where it was, as in a native text field:
+                state
+                    .cursor
+                    .set_char_range(Some(CCursorRange::one(cursor_at_pointer)));
+            }
+
             if did_interact || response.clicked() {
                 ui.memory_mut(|mem| mem.request_focus(response.id));
                 state.cursor_purpose = TextEditCursorPurpose::Selection;
@@ -979,7 +997,10 @@ impl<'t> TextEdit<'t> {
         if ui.is_rect_visible(inner_rect) {
             let has_focus = ui.memory(|mem| mem.has_focus(id));
 
+            // The native field draws the caret, the selection and the composition of a
+            // mirrored field (see `RawInput::text_edit_mirror`):
             if has_focus
+                && !mirrored
                 && (state.cursor_purpose.is_selection() || should_paint_ime_visuals_the_legacy_way)
                 && let Some(cursor_range) = state.cursor.range(&galley)
             {
@@ -1013,7 +1034,7 @@ impl<'t> TextEdit<'t> {
                     // * Don't give the impression that the user can type into a window without focus
                     // * Don't repaint the ui because of a blinking cursor in an app that is not in focus
                     let viewport_has_focus = ui.input(|i| i.focused);
-                    if viewport_has_focus {
+                    if viewport_has_focus && !mirrored {
                         let time_since_last_interaction = now - state.last_interaction_time;
                         let cursor_purpose = if should_paint_ime_visuals_the_legacy_way {
                             &TextEditCursorPurpose::Selection
@@ -1062,6 +1083,19 @@ impl<'t> TextEdit<'t> {
                                 rect: to_global * inner_rect,
                                 cursor_rect: to_global * primary_cursor_rect,
                                 should_interrupt_composition: false,
+                            });
+                            o.text_edit_mirror = mirrored.then(|| crate::output::TextEditMirror {
+                                text: text.as_str().to_owned(),
+                                anchor_chars: cursor_range.secondary.index.0,
+                                focus_chars: cursor_range.primary.index.0,
+                                field_rect: to_global * response.rect,
+                                // Where the text starts: an aligned galley lies left of its
+                                // own origin (see the painting of the galley above).
+                                text_origin: to_global * galley_pos,
+                                font_id: mirror_font_id.clone(),
+                                row_height: line_height,
+                                cursor_color: ui.visuals().text_cursor.stroke.color,
+                                scale: to_global.scaling,
                             });
                         });
                     }
@@ -1482,6 +1516,35 @@ fn events(
                     } => Some(CursorMutation::ImeCompositionCursorRange(
                         text.delete_surrounding_chars(cursor_range, *before_chars, *after_chars),
                     )),
+                    ImeEvent::ReplaceRange {
+                        range_chars,
+                        text: replacement,
+                    } => {
+                        let len = text.as_str().chars().count();
+                        let end = range_chars.end.min(len);
+                        let start = range_chars.start.min(end);
+                        let ccursor = insert_replacing_selection(
+                            text,
+                            &CCursorRange::two(CCursor::new(start), CCursor::new(end)),
+                            replacement,
+                            multiline,
+                            char_limit,
+                        );
+                        Some(CursorMutation::Selection(CCursorRange::one(ccursor)))
+                    }
+                    ImeEvent::SetSelection {
+                        anchor_chars,
+                        focus_chars,
+                    } => {
+                        let len = text.as_str().chars().count();
+                        cursor_range = CCursorRange {
+                            primary: CCursor::new((*focus_chars).min(len)),
+                            secondary: CCursor::new((*anchor_chars).min(len)),
+                            h_pos: None,
+                        };
+                        state.cursor_purpose = TextEditCursorPurpose::Selection;
+                        None
+                    }
                 }
             }
 

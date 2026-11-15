@@ -400,8 +400,9 @@ impl AppRunner {
             events: _,       // already handled
             mutable_text_under_cursor: _, // TODO(#4569): https://github.com/emilk/egui/issues/4569
             ime,
-            accesskit_update: _,        // not currently implemented
-            num_completed_passes: _,    // handled by `Context::run`
+            text_edit_mirror: _, // not asked for (see `egui::RawInput::text_edit_mirror`)
+            accesskit_update: _, // not currently implemented
+            num_completed_passes: _, // handled by `Context::run`
             request_discard_reasons: _, // handled by `Context::run`
         } = platform_output;
 

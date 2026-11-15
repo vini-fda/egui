@@ -1231,6 +1231,7 @@ impl State {
             events: _,                    // handled elsewhere
             mutable_text_under_cursor: _, // only used in eframe web
             ime,
+            text_edit_mirror: _, // `text_edit_mirror` is never asked for (see `RawInput`)
             accesskit_update,
             num_completed_passes: _,    // `egui::Context::run` handles this
             request_discard_reasons: _, // `egui::Context::run` handles this
