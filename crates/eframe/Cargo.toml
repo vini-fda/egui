@@ -256,6 +256,8 @@ web-sys = { workspace = true, features = [
   "FileList",
   "FocusEvent",
   "FocusOptions",
+  "FontFace",
+  "FontFaceSet",
   "HtmlCanvasElement",
   "HtmlElement",
   "HtmlInputElement",

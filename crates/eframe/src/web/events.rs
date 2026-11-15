@@ -335,10 +335,19 @@ pub(crate) fn on_keyup(event: web_sys::KeyboardEvent, runner: &mut AppRunner) {
     }
 }
 
+/// Whether `event` is on the text agent while it mirrors the focused `TextEdit` (see
+/// `TextAgent::is_mirroring`): the browser handles it, as it would for any text field.
+fn on_mirror(runner: &AppRunner, event: &web_sys::Event) -> bool {
+    runner.text_agent.is_mirroring() && runner.text_agent.is_target(event.target().as_ref())
+}
+
 fn install_copy_cut_paste(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), JsValue> {
     runner_ref.add_event_listener(target, "paste", |event: web_sys::ClipboardEvent, runner| {
         if !runner.input.raw.focused {
             return; // The eframe app is not interested
+        }
+        if on_mirror(runner, &event) {
+            return; // The browser's, and the edit comes back from the text agent
         }
 
         if let Some(data) = event.clipboard_data()
@@ -371,6 +380,9 @@ fn install_copy_cut_paste(runner_ref: &WebRunner, target: &EventTarget) -> Resul
         if !runner.input.raw.focused {
             return; // The eframe app is not interested
         }
+        if on_mirror(runner, &event) {
+            return; // The browser's, and the edit comes back from the text agent
+        }
 
         runner.input.raw.events.push(egui::Event::Cut);
 
@@ -394,6 +406,9 @@ fn install_copy_cut_paste(runner_ref: &WebRunner, target: &EventTarget) -> Resul
     runner_ref.add_event_listener(target, "copy", |event: web_sys::ClipboardEvent, runner| {
         if !runner.input.raw.focused {
             return; // The eframe app is not interested
+        }
+        if on_mirror(runner, &event) {
+            return; // The browser's, and the edit comes back from the text agent
         }
 
         runner.input.raw.events.push(egui::Event::Copy);
@@ -537,6 +552,9 @@ fn install_pointerdown(runner_ref: &WebRunner, target: &EventTarget) -> Result<(
         "pointerdown",
         |event: web_sys::PointerEvent, runner: &mut AppRunner| {
             runner.text_agent.set_touch(event.pointer_type() != "mouse");
+            if on_mirror(runner, &event) {
+                return;
+            }
             let modifiers = modifiers_from_mouse_event(&event);
             runner.input.set_modifiers(modifiers);
             let mut should_stop_propagation = true;
@@ -574,6 +592,9 @@ fn install_pointerup(runner_ref: &WebRunner, target: &EventTarget) -> Result<(),
         target,
         "pointerup",
         |event: web_sys::PointerEvent, runner| {
+            if on_mirror(runner, &event) {
+                return;
+            }
             let modifiers = modifiers_from_mouse_event(&event);
             runner.input.set_modifiers(modifiers);
 
@@ -645,7 +666,12 @@ fn is_interested_in_pointer_event(runner: &AppRunner, pos: egui::Pos2) -> bool {
         None
     };
 
-    let is_hovering_canvas = element_at_point.is_some_and(|element| element.eq(runner.canvas()));
+    // The text agent, when it lies over the focused `TextEdit` (see `TextAgent::set_touch`), is
+    // part of the canvas: a touch that starts on the canvas may end on it, once egui has
+    // focused the `TextEdit`.
+    let is_hovering_canvas = element_at_point.is_some_and(|element| {
+        element.eq(runner.canvas()) || runner.text_agent.is_target(Some(element.as_ref()))
+    });
     let is_pointer_down = runner
         .egui_ctx()
         .input(|i| i.pointer.any_down() || i.any_touches());
@@ -713,6 +739,9 @@ fn install_touchstart(
         target,
         "touchstart",
         move |event: web_sys::TouchEvent, runner| {
+            if on_mirror(runner, &event) {
+                return;
+            }
             let mut should_stop_propagation = true;
             let mut should_prevent_default = true;
             if let Some((pos, _)) = primary_touch_pos(runner, &event) {
@@ -744,6 +773,9 @@ fn install_touchstart(
 
 fn install_touchmove(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), JsValue> {
     runner_ref.add_event_listener(target, "touchmove", |event: web_sys::TouchEvent, runner| {
+        if on_mirror(runner, &event) {
+            return;
+        }
         if let Some((pos, touch)) = primary_touch_pos(runner, &event)
             && is_interested_in_pointer_event(
                 runner,
@@ -772,6 +804,9 @@ fn install_touchmove(runner_ref: &WebRunner, target: &EventTarget) -> Result<(),
 
 fn install_touchend(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), JsValue> {
     runner_ref.add_event_listener(target, "touchend", |event: web_sys::TouchEvent, runner| {
+        if on_mirror(runner, &event) {
+            return;
+        }
         if let Some((pos, touch)) = primary_touch_pos(runner, &event)
             && is_interested_in_pointer_event(
                 runner,
@@ -816,7 +851,9 @@ fn install_touchend(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), 
 
             // Fix virtual keyboard IOS
             // Need call focus at the same time of event
-            if runner.text_agent.has_focus() && !on_text_agent {
+            // (The agent that mirrors a `TextEdit` was focused while handling `pointerup`.)
+            if runner.text_agent.has_focus() && !on_text_agent && !runner.text_agent.is_mirroring()
+            {
                 runner.text_agent.set_focus(false);
                 runner.text_agent.set_focus(true);
             }
@@ -827,6 +864,9 @@ fn install_touchend(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), 
 /// The touches on the text agent, while it lies over the focused `TextEdit` (see
 /// `TextAgent::set_touch`): they go to egui as the canvas's would, but leave the browser
 /// free to open its text menu. Moving and lifting the finger are on the `document` already.
+///
+/// While the agent mirrors the `TextEdit` (see `TextAgent::is_mirroring`), its touches are
+/// the browser's alone: it moves the caret and selects, and that comes back from the agent.
 pub(crate) fn install_text_agent_touches(
     runner_ref: &WebRunner,
     input: &EventTarget,
@@ -841,6 +881,9 @@ fn install_touchcancel(runner_ref: &WebRunner, target: &EventTarget) -> Result<(
         target,
         "touchcancel",
         |event: web_sys::TouchEvent, runner| {
+            if on_mirror(runner, &event) {
+                return;
+            }
             push_touches(runner, egui::TouchPhase::Cancel, &event);
             event.stop_propagation();
             event.prevent_default();

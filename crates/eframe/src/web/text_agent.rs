@@ -75,16 +75,17 @@ impl TextAgent {
 
         // attach event listeners
 
-        runner_ref.add_event_listener(
-            &input,
-            "compositionstart",
+        runner_ref.add_event_listener(&input, "compositionstart", {
+            let input_state = Rc::clone(&input_state);
             move |_: web_sys::CompositionEvent, runner: &mut AppRunner| {
+                // The input is not written to while a composition is under way:
+                input_state.borrow_mut().composing = true;
                 // Repaint moves the text agent into place,
                 // see `AppRunner::handle_platform_output`, which calls
                 // `TextAgent::update`.
                 runner.needs_repaint.repaint_asap();
-            },
-        )?;
+            }
+        })?;
 
         runner_ref.add_event_listener(&input, "input", {
             let input_state = Rc::clone(&input_state);
@@ -95,11 +96,51 @@ impl TextAgent {
         runner_ref.add_event_listener(&input, "compositionend", {
             let input_state = Rc::clone(&input_state);
             move |_event: web_sys::CompositionEvent, runner: &mut AppRunner| {
-                input_state
-                    .borrow_mut()
-                    .handle_composition_end_event(runner);
+                let mut input_state = input_state.borrow_mut();
+                input_state.composing = false;
+                if input_state.mirror.is_some() {
+                    input_state.read_mirror(runner, false);
+                } else {
+                    input_state.handle_composition_end_event(runner);
+                }
             }
         })?;
+
+        // While the agent mirrors a `TextEdit` (see `InputState::update`), the browser moves
+        // the caret and selection itself, on touches, keys and its text menu:
+        runner_ref.add_event_listener(&document, "selectionchange", {
+            let input_state = Rc::clone(&input_state);
+            move |_event: web_sys::Event, runner: &mut AppRunner| {
+                let mut input_state = input_state.borrow_mut();
+                if input_state.mirror.is_some()
+                    && super::has_focus(&input_state.input)
+                    && !input_state.composing
+                {
+                    input_state.read_mirror(runner, false);
+                }
+            }
+        })?;
+
+        // Writing the mirror waits while a finger is on it (see `InputState::write_mirror`):
+        // it would move the handle being dragged, or close the text menu being opened.
+        runner_ref.add_event_listener(&input, "touchstart", {
+            let input_state = Rc::clone(&input_state);
+            move |_event: web_sys::TouchEvent, _runner: &mut AppRunner| {
+                input_state.borrow_mut().finger_down = true;
+            }
+        })?;
+        for event_name in ["touchend", "touchcancel"] {
+            runner_ref.add_event_listener(&input, event_name, {
+                let input_state = Rc::clone(&input_state);
+                move |event: web_sys::TouchEvent, runner: &mut AppRunner| {
+                    if event.touches().length() == 0 {
+                        input_state.borrow_mut().finger_down = false;
+                        // Make the write that waited:
+                        runner.needs_repaint.repaint_asap();
+                    }
+                }
+            })?;
+        }
 
         // While the agent lies over the focused `TextEdit` on a touch screen (see
         // `InputState::update`), the touches there land on the agent, not the canvas.
@@ -135,12 +176,25 @@ impl TextAgent {
     pub fn update(
         &self,
         ime: Option<egui::output::IMEOutput>,
+        mirror: Option<&egui::output::TextEditMirror>,
         canvas: &web_sys::HtmlCanvasElement,
-        zoom_factor: f32,
+        egui_ctx: &egui::Context,
     ) -> Result<(), JsValue> {
         self.input_state
             .borrow_mut()
-            .update(ime, canvas, zoom_factor)
+            .update(ime, mirror, canvas, egui_ctx)
+    }
+
+    /// See [`Self::set_touch`].
+    pub fn touch(&self) -> bool {
+        self.input_state.borrow().touch
+    }
+
+    /// Whether the agent is a copy of the focused `TextEdit`, which the browser edits (see
+    /// `egui::RawInput::text_edit_mirror`). Its touches, keys and clipboard are then the
+    /// browser's, and the edits come back to egui from the agent.
+    pub fn is_mirroring(&self) -> bool {
+        self.input_state.borrow().mirror.is_some()
     }
 
     /// Whether the last pointer to go down was a finger or a pen, rather than a mouse.
@@ -177,7 +231,15 @@ impl TextAgent {
 
         log::trace!("Focusing text agent");
 
-        if let Err(err) = super::focus_without_scroll(&self.input) {
+        // A copy of the `TextEdit` may lie where the on-screen keyboard will be. Letting the
+        // focus scroll lets iOS pan the page to keep it in view, as for any text field:
+        // touches behind the keyboard's area don't reach the page.
+        let focused = if self.is_mirroring() {
+            self.input.focus()
+        } else {
+            super::focus_without_scroll(&self.input)
+        };
+        if let Err(err) = focused {
             log::error!("failed to set focus: {}", super::string_from_js_value(&err));
         }
     }
@@ -196,7 +258,18 @@ impl TextAgent {
     }
 
     pub(crate) fn interrupt_ime_composition(&self) {
-        self.input_state.borrow_mut().clear();
+        let mut state = self.input_state.borrow_mut();
+        if state.mirror.is_some() {
+            // The agent holds the `TextEdit`'s text, not just a composition: writing that text
+            // again ends the composition.
+            if state.composing {
+                state.composing = false;
+                state.mirror_value.clear();
+                state.write_mirror();
+            }
+        } else {
+            state.clear();
+        }
     }
 }
 
@@ -217,6 +290,28 @@ struct InputState {
 
     /// Whether the agent lies over the focused `TextEdit`, to take its touches.
     covers_text_edit: bool,
+
+    /// The focused `TextEdit`, while the agent mirrors it (see [`TextAgent::is_mirroring`]).
+    mirror: Option<egui::output::TextEditMirror>,
+
+    /// The value eframe last read from the mirror, or wrote to it.
+    mirror_value: String,
+
+    /// The selection (anchor, focus), in characters, eframe last read from the mirror, or
+    /// wrote to it.
+    mirror_selection: (usize, usize),
+
+    /// The mirror's `scrollLeft` that lines its text up with egui's.
+    mirror_scroll_left: f64,
+
+    /// Whether the browser is composing text in the agent (IME).
+    composing: bool,
+
+    /// Whether a finger is on the agent.
+    finger_down: bool,
+
+    /// The fonts of egui added to the page, as `FontFace`s for the mirror, by name.
+    font_faces: std::collections::HashSet<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -257,21 +352,52 @@ impl InputState {
             keydown_special_case: KeydownSpecialCase::None,
             touch: false,
             covers_text_edit: false,
+            mirror: None,
+            mirror_value: String::new(),
+            mirror_selection: (0, 0),
+            mirror_scroll_left: 0.0,
+            composing: false,
+            finger_down: false,
+            font_faces: Default::default(),
         }
     }
 
     fn update(
         &mut self,
         ime: Option<egui::output::IMEOutput>,
+        mirror: Option<&egui::output::TextEditMirror>,
         canvas: &web_sys::HtmlCanvasElement,
-        zoom_factor: f32,
+        egui_ctx: &egui::Context,
     ) -> Result<(), JsValue> {
         let covers_text_edit = self.touch && ime.is_some();
+        let mirror = mirror.filter(|_| covers_text_edit);
+
+        if self.mirror.is_some() != mirror.is_some() {
+            // Starting or stopping to mirror: the value and selection are written afresh.
+            self.clear();
+        }
 
         // Don't move the text agent unless the position actually changed:
-        if self.ime_output == ime && self.covers_text_edit == covers_text_edit {
-            return Ok(());
+        if self.ime_output != ime
+            || self.covers_text_edit != covers_text_edit
+            || self.mirror.as_ref() != mirror
+        {
+            self.place(ime, mirror, covers_text_edit, canvas, egui_ctx)?;
         }
+
+        self.write_mirror();
+        Ok(())
+    }
+
+    fn place(
+        &mut self,
+        ime: Option<egui::output::IMEOutput>,
+        mirror: Option<&egui::output::TextEditMirror>,
+        covers_text_edit: bool,
+        canvas: &web_sys::HtmlCanvasElement,
+        egui_ctx: &egui::Context,
+    ) -> Result<(), JsValue> {
+        let zoom_factor = egui_ctx.zoom_factor();
         self.ime_output = ime;
         let style = self.input.style();
         if self.covers_text_edit != covers_text_edit {
@@ -284,6 +410,10 @@ impl InputState {
                 style.set_property("padding-left", "0")?;
             }
         }
+        if self.mirror.is_some() && mirror.is_none() {
+            self.unstyle_mirror()?;
+        }
+        self.mirror = mirror.cloned();
 
         let Some(ime) = ime else { return Ok(()) };
 
@@ -310,7 +440,13 @@ impl InputState {
         let visible_y = ime.cursor_rect.center().y * zoom_factor;
         let clamped_y = visible_y.clamp(0.0, logical_canvas_height);
 
-        if covers_text_edit {
+        if let Some(mirror) = mirror {
+            let canvas_rect = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(logical_canvas_width, logical_canvas_height),
+            );
+            self.style_mirror(&ime, mirror, canvas_rect, canvas, egui_ctx)?;
+        } else if covers_text_edit {
             // Lie over the text edit's text (within the canvas), with the left padding putting
             // the input's own caret where egui's is: that is where the IME input points to,
             // and where the browser's text menu opens.
@@ -353,9 +489,290 @@ impl InputState {
     fn clear(&mut self) {
         self.input.set_value("");
         self.last_text.clear();
+        self.mirror_value.clear();
+        self.mirror_selection = (0, 0);
+    }
+
+    /// Make the agent a copy of the focused `TextEdit`'s text, on top of it: same font,
+    /// size and place, so that the browser's caret, selection, handles and magnifier land
+    /// on egui's text. The agent's own text is transparent: egui draws the text.
+    fn style_mirror(
+        &mut self,
+        ime: &egui::output::IMEOutput,
+        mirror: &egui::output::TextEditMirror,
+        canvas_rect: egui::Rect,
+        canvas: &web_sys::HtmlCanvasElement,
+        egui_ctx: &egui::Context,
+    ) -> Result<(), JsValue> {
+        let zoom_factor = egui_ctx.zoom_factor();
+        let style = self.input.style();
+        let (font_family, font_scale) = self.font_family(egui_ctx, &mirror.font_id.family);
+
+        // Below 16px, iOS Safari zooms the page into a focused input. So the input is laid
+        // out at 16px and scaled down instead, which it accepts.
+        let font_size = mirror.font_id.size * font_scale * mirror.scale * zoom_factor;
+        let (css_font_size, s) = if font_size < 16.0 {
+            (16.0, font_size / 16.0)
+        } else {
+            (font_size, 1.0)
+        };
+
+        // The input covers the whole field, so that a touch anywhere on it is the browser's,
+        // as on a native field. Its padding puts its text where egui's is, and clips it about
+        // where egui clips it (to `ime.rect`).
+        let rect = (mirror.field_rect * zoom_factor).intersect(canvas_rect);
+        let text_rect = (ime.rect * zoom_factor).intersect(rect);
+        let origin = mirror.text_origin * zoom_factor;
+        let row_height = mirror.row_height * mirror.scale * zoom_factor;
+        let padding_left = (origin.x.max(text_rect.left()) - rect.left()).max(0.0);
+        // The browser keeps room for its caret after the text, and its text may come out a
+        // little wider than egui's: when the text fills egui's clip, the agent would scroll by
+        // itself. So give it some of the frame's room on the right. Its text is transparent.
+        let padding_right = (rect.right() - text_rect.right() - row_height).max(0.0);
+        let padding_top = (origin.y - rect.top()).clamp(0.0, rect.height());
+        let height = rect.height().max(padding_top + row_height);
+        let padding_bottom = (height - padding_top - row_height).max(0.0);
+        // egui scrolls the text to the left when it doesn't fit:
+        self.mirror_scroll_left = f64::from((text_rect.left() - origin.x).max(0.0) / s);
+
+        let px = |x: f32| format!("{}px", x / s);
+        style.set_property(
+            "left",
+            &format!("{}px", canvas.offset_left() as f32 + rect.left()),
+        )?;
+        style.set_property(
+            "top",
+            &format!("{}px", canvas.offset_top() as f32 + rect.top()),
+        )?;
+        style.set_property("width", &px(rect.width()))?;
+        style.set_property("height", &px(height))?;
+        style.set_property("padding-left", &px(padding_left))?;
+        style.set_property("padding-right", &px(padding_right))?;
+        style.set_property("padding-top", &px(padding_top))?;
+        style.set_property("padding-bottom", &px(padding_bottom))?;
+        style.set_property("line-height", &px(row_height))?;
+        style.set_property("font-size", &format!("{css_font_size}px"))?;
+        style.set_property("font-family", &font_family)?;
+        style.set_property("font-variant-ligatures", "none")?;
+        style.set_property("font-kerning", "normal")?;
+        style.set_property("letter-spacing", "0")?;
+        style.set_property("transform-origin", "0 0")?;
+        if s == 1.0 {
+            style.set_property("transform", "none")?;
+        } else {
+            style.set_property("transform", &format!("scale({s})"))?;
+        }
+        let [r, g, b, a] = mirror.cursor_color.to_srgba_unmultiplied();
+        style.set_property(
+            "caret-color",
+            &format!("rgba({r}, {g}, {b}, {})", f32::from(a) / 255.0),
+        )?;
+        style.set_property("pointer-events", "auto")?;
+        // Still invisible, its text and background being transparent: iOS Safari opens no
+        // text menu on an editable element it takes for hidden, at opacity 0.
+        style.set_property("opacity", "1")?;
+
+        // A password field gets the browser's password handling: no Copy, and a double tap
+        // selects a word's worth of dots rather than the whole value.
+        if ime.purpose == egui::IMEPurpose::Password {
+            if self.input.type_() != "password" {
+                self.input.set_type("password");
+                self.input
+                    .set_attribute("autocomplete", "current-password")?;
+            }
+        } else if self.input.type_() != "text" {
+            self.input.set_type("text");
+            self.input.remove_attribute("autocomplete")?;
+        }
+
+        Ok(())
+    }
+
+    /// Undo [`Self::style_mirror`].
+    fn unstyle_mirror(&self) -> Result<(), JsValue> {
+        let style = self.input.style();
+        for property in [
+            "padding-right",
+            "padding-top",
+            "padding-bottom",
+            "line-height",
+            "font-family",
+            "font-variant-ligatures",
+            "font-kerning",
+            "letter-spacing",
+            "transform",
+            "transform-origin",
+        ] {
+            style.remove_property(property)?;
+        }
+        style.set_property("padding-left", "0")?;
+        style.set_property("font-size", "16px")?;
+        style.set_property("caret-color", "transparent")?;
+        if self.input.type_() != "text" {
+            self.input.set_type("text");
+            self.input.remove_attribute("autocomplete")?;
+        }
+        Ok(())
+    }
+
+    /// The CSS `font-family` of egui's `family`, with its whole fallback chain, and the scale
+    /// egui gives its first font. Adds egui's fonts to the page, as needed.
+    fn font_family(
+        &mut self,
+        egui_ctx: &egui::Context,
+        family: &egui::FontFamily,
+    ) -> (String, f32) {
+        let document = web_sys::window().and_then(|w| w.document());
+        egui_ctx.fonts(|fonts| {
+            let definitions = fonts.definitions();
+            let names = definitions
+                .families
+                .get(family)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let mut css = Vec::with_capacity(names.len());
+            for name in names {
+                let css_name = format!("\"egui {}\"", name.replace(['"', '\\'], ""));
+                if !self.font_faces.contains(name)
+                    && let Some(data) = definitions.font_data.get(name)
+                    && let Some(document) = &document
+                {
+                    let bytes: &[u8] = (*data.font).as_ref();
+                    match web_sys::FontFace::new_with_u8_array(&css_name, bytes) {
+                        Ok(face) => {
+                            if let Err(err) = document.fonts().add(&face) {
+                                log::warn!(
+                                    "failed to add font {name:?}: {}",
+                                    super::string_from_js_value(&err)
+                                );
+                            }
+                        }
+                        Err(err) => log::warn!(
+                            "failed to load font {name:?}: {}",
+                            super::string_from_js_value(&err)
+                        ),
+                    }
+                    self.font_faces.insert(name.clone());
+                }
+                css.push(css_name);
+            }
+            css.push("monospace".to_owned());
+            let scale = names
+                .first()
+                .and_then(|name| definitions.font_data.get(name))
+                .map_or(1.0, |data| data.tweak.scale);
+            (css.join(", "), scale)
+        })
+    }
+
+    /// Write egui's text and selection to the mirror, if they changed since eframe last read
+    /// or wrote them. Not while the browser is editing: during a composition, or with a
+    /// finger on the agent (a write moves the handle being dragged); it waits until then.
+    fn write_mirror(&mut self) {
+        let Some(mirror) = &self.mirror else { return };
+        if self.composing || self.finger_down {
+            return;
+        }
+
+        let text_changed = mirror.text != self.mirror_value;
+        if text_changed {
+            self.input.set_value(&mirror.text);
+            self.mirror_value.clone_from(&mirror.text);
+        }
+
+        let selection = (mirror.anchor_chars, mirror.focus_chars);
+        if text_changed || selection != self.mirror_selection {
+            let (anchor, focus) = selection;
+            let start = utf16_offset(&mirror.text, anchor.min(focus));
+            let end = utf16_offset(&mirror.text, anchor.max(focus));
+            let direction = if focus < anchor {
+                "backward"
+            } else {
+                "forward"
+            };
+            if let Err(err) = self
+                .input
+                .set_selection_range_with_direction(start, end, direction)
+            {
+                log::warn!(
+                    "failed to select in the text agent: {}",
+                    super::string_from_js_value(&err)
+                );
+            }
+            self.mirror_selection = selection;
+        }
+
+        // Through `Reflect`: web-sys types `scrollLeft` differently with `web_sys_unstable_apis`.
+        let scroll_left = js_sys::Reflect::get(&self.input, &"scrollLeft".into())
+            .ok()
+            .and_then(|value| value.as_f64())
+            .unwrap_or_default();
+        if (scroll_left - self.mirror_scroll_left).abs() >= 1.0 {
+            js_sys::Reflect::set(
+                &self.input,
+                &"scrollLeft".into(),
+                &self.mirror_scroll_left.round().into(),
+            )
+            .ok();
+        }
+    }
+
+    /// Tell egui how the browser changed the mirror's text and selection.
+    ///
+    /// `force_selection`: send the selection even if it seems unchanged.
+    fn read_mirror(&mut self, runner: &mut AppRunner, force_selection: bool) {
+        let value = self.input.value();
+        let text_changed = value != self.mirror_value;
+        if text_changed {
+            let (range_chars, text) = replaced_range(&self.mirror_value, &value);
+            runner
+                .input
+                .raw
+                .events
+                .push(egui::Event::Ime(egui::ImeEvent::ReplaceRange {
+                    range_chars,
+                    text,
+                }));
+            self.mirror_value.clone_from(&value);
+        }
+
+        if let Some(selection) = self.read_selection(&value)
+            && (text_changed || force_selection || selection != self.mirror_selection)
+        {
+            let (anchor_chars, focus_chars) = selection;
+            runner
+                .input
+                .raw
+                .events
+                .push(egui::Event::Ime(egui::ImeEvent::SetSelection {
+                    anchor_chars,
+                    focus_chars,
+                }));
+            self.mirror_selection = selection;
+        }
+
+        runner.needs_repaint.repaint_asap();
+    }
+
+    /// The agent's selection (anchor, focus), in characters of `value`.
+    fn read_selection(&self, value: &str) -> Option<(usize, usize)> {
+        let start = self.input.selection_start().ok()??;
+        let end = self.input.selection_end().ok()??;
+        let start = char_offset(value, start);
+        let end = char_offset(value, end);
+        let backward =
+            self.input.selection_direction().ok().flatten().as_deref() == Some("backward");
+        Some(if backward { (end, start) } else { (start, end) })
     }
 
     fn handle_input_event(&mut self, event: &web_sys::InputEvent, runner: &mut AppRunner) {
+        if self.mirror.is_some() {
+            // Whatever the browser did (typing, a correction, a paste, a cut, a composition,
+            // an edit it made for a key), the change is in the value:
+            self.read_mirror(runner, false);
+            return;
+        }
+
         if self
             .ime_output
             .as_ref()
@@ -495,6 +912,11 @@ impl InputState {
         // https://web.archive.org/web/20200526195704/https://www.fxsitecompat.dev/en-CA/docs/2018/keydown-and-keyup-events-are-now-fired-during-ime-composition/
         if event.is_composing() || !matches!(special_case, KeydownSpecialCase::None) {
             true
+        } else if input_state.borrow().mirror.is_some() {
+            // The browser applies an editing key to the mirror, and the change comes back as
+            // an `input` or `selectionchange` event; egui applying it too would do it twice.
+            // Other keys (Enter, Tab, Escape, shortcuts) are egui's.
+            is_editing_key(event)
         } else {
             if event.key().chars().count() > 1
                 || event.ctrl_key()
@@ -516,6 +938,68 @@ impl InputState {
         // https://web.archive.org/web/20200526195704/https://www.fxsitecompat.dev/en-CA/docs/2018/keydown-and-keyup-events-are-now-fired-during-ime-composition/
         event.is_composing() || event.key_code() == 229
     }
+}
+
+/// Whether the browser edits the text, or moves in it, for this key.
+fn is_editing_key(event: &web_sys::KeyboardEvent) -> bool {
+    let key = event.key();
+    if matches!(
+        key.as_str(),
+        "Backspace"
+            | "Delete"
+            | "ArrowLeft"
+            | "ArrowRight"
+            | "ArrowUp"
+            | "ArrowDown"
+            | "Home"
+            | "End"
+            | "PageUp"
+            | "PageDown"
+    ) {
+        return true;
+    }
+    // Select all, copy, cut, paste, undo, redo, and the Emacs keys of macOS and iPadOS:
+    let mut chars = key.chars();
+    (event.ctrl_key() || event.meta_key())
+        && matches!(
+            (chars.next(), chars.next()),
+            (Some(c), None) if "abcefhknpuvwxyz".contains(c.to_ascii_lowercase())
+        )
+}
+
+/// The UTF-16 offset of the character at `char_offset` in `text`.
+fn utf16_offset(text: &str, char_offset: usize) -> u32 {
+    text.chars()
+        .take(char_offset)
+        .map(|c| c.len_utf16() as u32)
+        .sum()
+}
+
+/// The character at the UTF-16 offset `utf16_offset` in `text`, or the one it falls inside.
+fn char_offset(text: &str, utf16_offset: u32) -> usize {
+    let mut utf16 = 0;
+    text.chars()
+        .take_while(|c| {
+            utf16 += c.len_utf16() as u32;
+            utf16 <= utf16_offset
+        })
+        .count()
+}
+
+/// How `old` became `new`: the characters of `old` replaced, and what by.
+fn replaced_range(old: &str, new: &str) -> (core::ops::Range<usize>, String) {
+    let old: Vec<char> = old.chars().collect();
+    let new: Vec<char> = new.chars().collect();
+    let prefix = core::iter::zip(&old, &new)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let suffix = core::iter::zip(old[prefix..].iter().rev(), new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    (
+        prefix..old.len() - suffix,
+        new[prefix..new.len() - suffix].iter().collect(),
+    )
 }
 
 fn longest_common_prefix_length(a: &str, b: &str) -> usize {

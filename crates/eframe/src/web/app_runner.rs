@@ -265,6 +265,9 @@ impl AppRunner {
 
         let canvas_size = super::canvas_size_in_points(self.canvas(), self.egui_ctx());
         let mut raw_input = self.input.new_frame(canvas_size);
+        // On a touch screen, the text agent mirrors the focused `TextEdit`, so that the
+        // browser's own text handling (selection handles, magnifier, text menu) applies to it:
+        raw_input.text_edit_mirror = self.text_agent.touch();
 
         if super::DEBUG_RESIZE {
             log::info!(
@@ -400,9 +403,9 @@ impl AppRunner {
             events: _,       // already handled
             mutable_text_under_cursor: _, // TODO(#4569): https://github.com/emilk/egui/issues/4569
             ime,
-            text_edit_mirror: _, // not asked for (see `egui::RawInput::text_edit_mirror`)
-            accesskit_update: _, // not currently implemented
-            num_completed_passes: _, // handled by `Context::run`
+            text_edit_mirror,
+            accesskit_update: _,        // not currently implemented
+            num_completed_passes: _,    // handled by `Context::run`
             request_discard_reasons: _, // handled by `Context::run`
         } = platform_output;
 
@@ -423,6 +426,21 @@ impl AppRunner {
 
         super::set_cursor_icon(self.canvas(), cursor_icon);
 
+        // Place the agent before focusing it: when the focus opens the on-screen keyboard,
+        // iOS pans the page to keep the focused element above it, and touches behind the
+        // keyboard's area don't reach the page.
+        if let Err(err) = self.text_agent.update(
+            ime,
+            text_edit_mirror.as_ref(),
+            self.canvas(),
+            &self.egui_ctx,
+        ) {
+            log::error!(
+                "failed to update text agent position: {}",
+                super::string_from_js_value(&err)
+            );
+        }
+
         if self.has_focus() {
             // The eframe app has focus.
             if let Some(ime) = ime {
@@ -436,16 +454,6 @@ impl AppRunner {
                 self.text_agent.blur();
                 super::focus_without_scroll(self.canvas()).ok();
             }
-        }
-
-        if let Err(err) = self
-            .text_agent
-            .update(ime, self.canvas(), self.egui_ctx.zoom_factor())
-        {
-            log::error!(
-                "failed to update text agent position: {}",
-                super::string_from_js_value(&err)
-            );
         }
     }
 }
